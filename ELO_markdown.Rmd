@@ -1,0 +1,464 @@
+---
+title: 'Harvard Data Science Capstone: Elo Merchant Category Recommendation'
+author: "James Hope"
+date: "1/24/2019"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+    theme: cosmo
+---
+
+Right now, Elo, one of the largest payment brands in Brazil, has built partnerships with merchants in order to offer promotions or discounts to cardholders. But do these promotions work for either the consumer or the merchant? Do customers enjoy their experience? Do merchants see repeat business? Personalization is key.
+
+Elo has built machine learning models to understand the most important aspects and preferences in their customers’ lifecycle, from food to shopping. But so far none of them is specifically tailored for an individual or profile. 
+
+In this task I am developing an algorithm to identify and serve the most relevant opportunities to individuals, by uncovering signal in customer loyalty. This will enable Elo reduce unwanted campaigns, to create the right experience for customers. 
+
+## Data files I will be using for this task
+
+I will need, at a minimum, the train.csv and test.csv files. These contain the card_ids that we'll be using for training and prediction.
+
+The historical_transactions.csv and new_merchant_transactions.csv files contain information about each card's transactions. historical_transactions.csv contains up to 3 months' worth of transactions for every card at any of the provided merchant_ids. new_merchant_transactions.csv contains the transactions at new merchants (merchant_ids that this particular card_id has not yet visited) over a period of two months.
+
+merchants.csv contains aggregate information for each merchant_id represented in the data set.
+
+## How is the data formatted
+
+The data is formatted as follows:
+
+train.csv and test.csv contain card_ids and information about the card itself - the first month the card was active, etc. train.csv also contains the target.
+
+historical_transactions.csv and new_merchant_transactions.csv are designed to be joined with train.csv, test.csv, and merchants.csv. They contain information about transactions for each card, as described above.
+
+merchants can be joined with the transaction sets to provide additional merchant-level information.
+
+## What I am predicting
+
+I will be building a model that predicts a loyalty score for each card_id. I will report the best RMSE.
+
+## File descriptions
+
+The following files have been provided.
+
+* train.csv - the training set
+* test.csv - the test set
+* sample_submission.csv - a sample submission file in the correct format - contains all card_ids that I will be predicting for.
+* historical_transactions.csv - up to 3 months' worth of historical transactions for each card_id
+* merchants.csv - additional information about all merchants / merchant_ids in the dataset.
+* new_merchant_transactions.csv - two months' worth of data for each card_id containing ALL purchases that card_id made at merchant_ids that were not visited in the historical data.
+
+# Data Import
+
+First we'll set up our environment, import the data and install a number of packages that we'll be using.
+
+```{r import, echo=FALSE}
+list.of.packages <- c("corrplot","xgboost","mlbench","caret","lubridate","magrittr","tidyverse","dplyr","ggplot2","Matrix","Ckmeans.1d.dp")
+repo='http://nbcgib.uesc.br/mirrors/cran/'
+install.packages(list.of.packages, repo = repo)
+lapply(list.of.packages, require, character.only = TRUE)
+
+library(data.table)
+library(lubridate)
+library(scales)
+library(ggplot2)
+library(Matrix)
+library(dplyr)
+library(gridExtra)
+library(corrplot)
+
+test <- read_csv("~/desktop/capstone_2/test.csv")
+train <- read_csv("~/desktop/capstone_2/train.csv")
+```
+
+```{r basic, echo=TRUE}
+head(test) 
+head(train) 
+```
+
+# Data Exploration & Visualisation
+
+## Train / Test
+
+There is a total of 5 features:
+
+* __card_id__ - unique card identifier
+* __first_active_month__ - 'YYYY-MM', month of first purchase
+* __feature_1__ - anonymized card categorical feature
+* __feature_2__ - anonymized card categorical feature
+* __feature_3__ - anonymized card categorical feature
+
+Let's plot how the dates of the first purchases are distributed:
+```{r dates_distr, echo=FALSE}
+train %>% 
+  bind_rows(test) %>% 
+  mutate(set = factor(if_else(is.na(target), "Test", "Train")),
+         first_active_month = ymd(first_active_month, truncated = 1)) %>% 
+  ggplot(aes(x = first_active_month, fill = set)) +
+  geom_bar() +
+  theme_minimal()
+```  
+
+We note the distribution of features across the train and test data.
+```{r explore test and train, echo=FALSE}
+train %>% 
+  bind_rows(test) %>% 
+  mutate(set = factor(if_else(is.na(target), "Test", "Train")),
+         first_active_month = ymd(first_active_month, truncated = 1)) %>% 
+  ggplot(aes(x = first_active_month, fill = set)) +
+  geom_bar() +
+  theme_minimal()
+
+train %>% 
+  bind_rows(test) %>% 
+  mutate(set = factor(if_else(is.na(target), "Test", "Train"))) %>% 
+  select(-first_active_month, -card_id, -target) %>% 
+  gather(key = "feature", value = "value", -set) %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = set)) +
+  geom_bar(aes(y=..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(set ~ feature, scales = "free") +
+  theme_minimal()
+```
+
+## Correlation
+Let's convert categorical features to dummy variables and check correlations:
+
+```{r correlation, echo=FALSE}
+train %>% 
+  mutate(feature_1 = factor(feature_1),
+         feature_2 = factor(feature_2),
+         feature_2 = factor(feature_2)) %>% 
+  select(-first_active_month, -card_id) %>% 
+  model.matrix(~.-1, .) %>% 
+  cor(method = "spearman") %>%
+  corrplot(type="lower", method = "number", tl.col = "black", diag=FALSE, tl.cex = 0.9, number.cex = 0.9)
+```
+
+We notice that Feature 1 and Feature 3 are correlated, however the correlation coefficient is relatively low, and typically too low to remove a feature.
+
+## Transaction Data
+
+Let's read in the historical and new merchant transaction data. There are a total of 14 features in each dataset.
+
+There is a total of 14 features in each dataset:
+
+* __card_id__ - card identifier
+* __month_lag__ - month lag to reference date
+* __purchase_date__ - purchase date
+* __authorized_flag__ - ‘Y’ if approved, ‘N’ if denied
+* __category_3__ - anonymized category
+* __installments__ - number of installments of purchase
+* __category_1__ - anonymized category
+* __merchant_category_id__ - merchant category identifier (anonymized)
+* __subsector_id__ - merchant category group identifier (anonymized)
+* __merchant_id__ - merchant identifier (anonymized)
+* __purchase_amount__ - normalized purchase amount
+* __city_id__ - city identifier (anonymized)
+* __state_id__ - state identifier (anonymized)
+* __category_2__ - anonymized category
+
+```{r read supplemental data, echo=FALSE}
+sample_submission <- read_csv("~/desktop/capstone_2/sample_submission.csv")
+merchants <- read_csv("~/desktop/capstone_2/merchants.csv")
+historical_transactions <- read_csv("~/desktop/capstone_2/historical_transactions.csv")
+new_merchant_transactions <- read_csv("~/desktop/capstone_2/new_merchant_transactions.csv")
+```
+
+```{r view supplemental data, echo=FALSE}
+head(sample_submission) 
+head(historical_transactions) 
+head(merchants) 
+head(new_merchant_transactions) 
+```
+
+## Purchase date
+
+We note a bias in the distribution by purchase date.
+
+```{r view transaction data by date, echo=FALSE}
+p1 <- historical_transactions %>%
+  sample_n(6e6) %>% 
+  mutate(date = date(purchase_date)) %>% 
+  ggplot(aes(x = date)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Historical")
+p2 <- new_merchant_transactions %>%
+  mutate(date = date(purchase_date)) %>% 
+  ggplot(aes(x = date)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("New")
+grid.arrange(p1, p2, ncol=2)
+```
+
+## Purchase Data by Hour
+
+We note a bias in the distribution by hour.
+
+```{r view transaction data by hour, echo=FALSE}
+p1 <- historical_transactions %>% 
+  sample_n(6e6) %>% 
+  mutate(hour = hour(purchase_date)) %>% 
+  ggplot(aes(x = hour)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  ggtitle("Historical")
+p2 <- new_merchant_transactions %>% 
+  mutate(hour = hour(purchase_date)) %>% 
+  ggplot(aes(x = hour)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  ggtitle("New")
+
+grid.arrange(p1, p2, ncol=2)
+
+```
+
+## Other features 
+
+```{r view other features, echo=FALSE}
+p1 <- historical_transactions %>%
+  sample_n(6e6) %>% 
+  select(authorized_flag, category_1, category_2, category_3) %>% 
+  mutate(category_2 = as.character(category_2)) %>% 
+  gather(key = "feature", value = "value") %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = feature)) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("Historical") +
+  theme(legend.position = "none")
+p2 <- new_merchant_transactions %>%
+  select(authorized_flag, category_1, category_2, category_3) %>% 
+  mutate(category_2 = as.character(category_2)) %>% 
+  gather(key = "feature", value = "value") %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = feature)) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("New") +
+  theme(legend.position = "none")
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## Merchants
+
+In this additional dataset, there is a total of 22 features:
+
+* __merchant_id__ - unique merchant identifier
+* __merchant_group_id__ - merchant group (anonymized )
+* __merchant_category_id__ - unique identifier for merchant category (anonymized )
+* __subsector_id__ - merchant category group (anonymized )
+* __numerical_1__ - anonymized measure
+* __numerical_2__ - anonymized measure
+* __category_1__ - anonymized category
+* __most_recent_sales_range__ - range of revenue (monetary units) in last active month –> A > B > C > D > E
+* __most_recent_purchases_range__ - range of quantity of transactions in last active month –> A > B > C > D > E
+* __avg_sales_lag3__ - monthly average of revenue in last 3 months divided by revenue in last active month
+* __avg_purchases_lag3__ - monthly average of transactions in last 3 months divided by transactions in last active month
+* __active_months_lag3__ - quantity of active months within last 3 months
+* __avg_sales_lag6__ - monthly average of revenue in last 6 months divided by revenue in last active month
+* __avg_purchases_lag6__ - monthly average of transactions in last 6 months divided by transactions in last active month
+* __active_months_lag6__ - quantity of active months within last 6 months
+* __avg_sales_lag12__ - monthly average of revenue in last 12 months divided by revenue in last active month
+* __avg_purchases_lag12__ - monthly average of transactions in last 12 months divided by transactions in last active month
+* __active_months_lag12__ - quantity of active months within last 12 months
+category_4 - anonymized category
+* __city_id__ - city identifier (anonymized )
+* __state_id__ - sState identifier (anonymized )
+* __category_2__ - anonymized category
+
+This additional dataset contains many numerical features.
+
+# Model Building
+
+In an ideal world we would want to build and compare the accuracy of models. However, because of the large number of predictive features in the data provided we will use Xgboost (eXtreme Gradient Boosting package) to build a predictive model. Xgboost includes an efficient linear model solver and tree learning algorithms and will automatically do parallel computation on a single machine which can be more than 10 times faster than existing gradient boosting packages. More information on Xgboost can be found here: https://xgboost.readthedocs.io/en/latest/R-package/xgboostPresentation.html
+
+## Data Processing
+
+```{r pre-processing historical transaction data, echo=FALSE}
+# We'll reload the data here for data processing.
+train_data <-read_csv("~/desktop/capstone_2/train.csv")
+test_data <-read_csv("~/desktop/capstone_2/test.csv")
+htrans <- read_csv("~/desktop/capstone_2/historical_transactions.csv")
+merchants <- read_csv("~/desktop/capstone_2/merchants.csv")
+ntrans <- read_csv("~/desktop/capstone_2/new_merchant_transactions.csv")
+```
+
+We'll prepare the data ready for model fitting by performing the following steps:
+* Separate the historical transaction data into authorised (htrans_auth) and unauthorised (htrans)
+* Join the merchant information to the new transactions data (ntrans)
+
+For the htrans_auth, htrans and ntrans: 
+* One-Hot-Encode the category information in each using model.matrix.lm()
+* Add statistical features (mean, standard deviation etc.) for each feature
+* Separate purchase_date into hours, days etc
+
+```{r pre-processing new transaction data, echo=FALSE}
+
+htrans_auth <- htrans %>% 
+  filter(authorized_flag == "Y") %>% 
+  select(-authorized_flag) %>% 
+  rename(card = card_id)
+
+htrans <- htrans %>% 
+  filter(authorized_flag == "N") %>% 
+  select(-authorized_flag) %>% 
+  rename(card = card_id)
+
+ntrans %<>% 
+  left_join(merchants, by = "merchant_id", suffix = c("", "_mer")) %>%
+  select(-authorized_flag) %>% 
+  rename(card = card_id)  
+
+rm(merchants); invisible(gc())  
+
+for (tx in c("htrans_auth", "htrans", "ntrans")) {
+
+  ohe <- paste0("ohe_", tx)
+  assign(ohe,
+         get(tx) %>%
+           select(starts_with("category"), starts_with("most_recent")) %>% 
+           mutate_all(factor) %>% 
+           model.matrix.lm(~ . - 1, ., na.action = NULL) %>% 
+           as_tibble())
+  
+  fn <- funs(mean, sd, min, max, sum, n_distinct, .args = list(na.rm = TRUE))
+  
+  sum_tx <- paste0("sum_", tx) 
+  assign(sum_tx, 
+         get(tx) %>%
+           select(-starts_with("category"), -starts_with("most_recent"), -contains("_id")) %>% 
+           add_count(card) %>%
+           group_by(card) %>%
+           mutate(date_diff = as.integer(diff(range(purchase_date))),
+                  prop = n() / sum(n)) %>% 
+           ungroup() %>% 
+           mutate(year = year(purchase_date),
+                  month = month(purchase_date),
+                  day = day(purchase_date),
+                  hour = hour(purchase_date),
+                  month_diff = as.integer(ymd("2018-12-01") - date(purchase_date)) / 30 + month_lag) %>% 
+           select(-purchase_date) %>% 
+           bind_cols(get(ohe)) %>% 
+           group_by(card) %>%
+           summarise_all(fn))
+           
+  rm(list = c(ohe, tx, "fn", "ohe", "sum_tx"))
+  gc()
+}
+```
+
+Next we can bind train and test together and then join the feature enhanced historical and new transaction data on card_id. We'll create new predictive features for the year, month and date difference for the first_active_month for each card. We will convert the data into a matrix as is required by Xgboost.
+
+```{r joining the dataset, echo=FALSE}
+# Joining dataset
+tr <-train_data 
+te <- test_data
+
+tri <- 1:nrow(tr)
+y <- tr$target
+
+tr_te <- tr %>% 
+  select(-target) %>% 
+  bind_rows(te) %>%
+  rename(card = card_id) %>% 
+  mutate(first_active_month = ymd(first_active_month, truncated = 1),
+         year = year(first_active_month),
+         month = month(first_active_month),
+         date_diff = as.integer(ymd("2018-02-01") - first_active_month),
+         weekend = as.integer(wday(first_active_month) %in% c(1, 7))) %>% 
+  select(-first_active_month) %>% 
+  left_join(sum_htrans_auth, by = "card") %>% 
+  left_join(sum_htrans, by = "card") %>% 
+  left_join(sum_ntrans, by = "card") %>% 
+  select(-card) %>% 
+  mutate_all(funs(ifelse(is.infinite(.), NA, .))) %>% 
+  mutate_all(funs(ifelse(is.na(.), 0, .))) %>%
+  select_if(~ n_distinct(.x) > 1) %>% 
+  data.matrix()
+  
+cols <- colnames(tr_te)  
+#rm(tr, te, sum_htrans_auth, sum_htrans, sum_ntrans, tx)
+invisible(gc())
+```
+
+## Preparing the Data
+
+Next we'll partition the data into a training, validation and test set ready to feed into the Gradient Boost algorithm. 
+
+```{r preparing XGB, echo=FALSE}
+#preparing Data to apply XGB
+install.packages("xgboost", repos='http://nbcgib.uesc.br/mirrors/cran/')
+library(xgboost)
+
+val <- caret::createDataPartition(y, p = 0.2, list = FALSE)
+dtrain <- xgb.DMatrix(data = tr_te[tri, ][-val, ], label = y[-val])
+dval <- xgb.DMatrix(data = tr_te[tri, ][val, ], label = y[val])
+dtest <- xgb.DMatrix(data = tr_te[-tri, ])
+cols <- colnames(tr_te)
+
+rm(tr_te, y, tri); gc()
+```
+
+# Model Training
+
+## Defining the Hyperparameters & Cost Function
+
+Now we can train the Xgboost model. We'll use linear regression with the RMSE as the cost function. 
+
+```{r set model params XGB, echo=TRUE}
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.02,
+          max_depth = 7,
+          min_child_weight = 100,
+          gamma = 0,
+          subsample = 0.85,
+          colsample_bytree = 0.8,
+          colsample_bylevel = 0.8,
+          alpha = 0,
+          lambda = 0.1)
+```
+
+## Training the Model
+
+We'll train the model using this simple peice of code. We'll train the Xgboost model until the RMSE hasn't improved in 200 rounds. Further information on the training parameters can be found here: https://www.rdocumentation.org/packages/xgboost/versions/0.71.2/topics/xgb.train
+
+```{r train XGB, include=TRUE, echo=FALSE}
+set.seed(0)
+m_xgb <- xgb.train(p, dtrain, 100, list(val = dval), print_every_n = 100, early_stopping_rounds = 200)
+
+#xgb.importance(cols, model = m_xgb) %>% 
+#  xgb.ggplot.importance(top_n = 20) + theme_minimal()
+```
+
+# Predictions
+
+Finally we'll make predictions with the model. Note that the label provided to Xgboost was the logarithmic RMSE, so the model will output predictions of the logarithmic RMSE. In other words, we won't need to calculate this. 
+
+Finally we report the best RSME score reported by the model.
+
+```{r predict XGB, echo=FALSE}
+target <- predict(m_xgb,dtest)
+best_score <- round(m_xgb$best_score, 5)
+
+best_score
+
+read_csv("~/desktop/capstone_2/sample_submission.csv") %>%  
+  mutate(target = predict(m_xgb, dtest)) %>%
+ write_csv(paste0("submission", round(m_xgb$best_score, 5), ".csv"))
+```
+
+
